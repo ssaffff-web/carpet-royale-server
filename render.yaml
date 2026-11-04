@@ -1,0 +1,10 @@
+# Render Blueprint: New -> Blueprint -> выберите этот репозиторий. Пароль и ключи не нужны.
+services:
+  - type: web
+    name: carpet-royale-server
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    autoDeployTrigger: commit
