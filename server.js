@@ -4,6 +4,7 @@
 // и пересылает пакеты Godot-мультиплеера внутри комнаты по звезде: все клиенты <-> хозяин (peer 1).
 //
 // Текстовые сообщения (JSON):
+//   обрыв связи: сервер держит место 20 с (лобби) / 90 с (матч); клиент шлёт resume{room,id,token}; хозяину: away/back, клиентам: host_away/host_back
 //   клиент -> сервер: list | ping{ts,rtt} | create{room,name,max} | join{room,name} | state{playing} | kick{id} | leave
 //   сервер -> клиент: hello | rooms{rooms:[...]} | pong{ts} | created{id,room} | joined{id,room}
 //                      | peer{id} | gone{id} | closed{reason} | error{msg}
@@ -11,6 +12,7 @@
 //   хозяин (id 1): кому > 0 - одному, 0 - всем клиентам, < 0 - всем, кроме -кому.  клиент: всегда хозяину.
 
 const http = require('http');
+const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
@@ -19,6 +21,8 @@ const MAX_CLIENTS = 1000;
 const MAX_PLAYERS_LIMIT = 8;
 const LIST_PUSH_MS = 2000;
 const MAX_PAYLOAD = 64 * 1024;
+const GRACE_LOBBY_MS = 20 * 1000;     // сколько держим место игрока после обрыва связи (лобби)
+const GRACE_MATCH_MS = 90 * 1000;     // ... и во время матча
 const BACKPRESSURE = 256 * 1024;   // не пересылаем «ненадёжные» пакеты, если у получателя забит буфер
 
 const rooms = new Map();   // roomId -> {id,name,max,host,members:Map<peerId,client>,playing,created,nextId}
@@ -73,7 +77,11 @@ function leaveRoom(ws, reason) {
   const r = ws.room;
   if (!r) return;
   ws.room = null;
+  const tm = r.timers.get(ws.peerId);
+  if (tm) { clearTimeout(tm); r.timers.delete(ws.peerId); }
+  r.tokens.delete(ws.peerId);
   if (r.host === ws) {
+    for (const t of r.timers.values()) clearTimeout(t);
     // хозяин ушёл: комната закрывается
     rooms.delete(r.id);
     for (const [, m] of r.members) {
@@ -131,13 +139,17 @@ wss.on('connection', (ws) => {
           playing: false,
           created: Date.now(),
           nextId: 2,
+          tokens: new Map(),
+          timers: new Map(),
         };
         ws.room = room;
         ws.peerId = 1;
         ws.browsing = false;
         room.members.set(1, ws);
         rooms.set(room.id, room);
-        sendJson(ws, { t: 'created', id: 1, room: room.id });
+        const tok = crypto.randomBytes(8).toString('hex');
+        room.tokens.set(1, tok);
+        sendJson(ws, { t: 'created', id: 1, room: room.id, token: tok });
         broadcastRooms();
         break;
       }
@@ -152,7 +164,9 @@ wss.on('connection', (ws) => {
         ws.peerId = id;
         ws.browsing = false;
         r.members.set(id, ws);
-        sendJson(ws, { t: 'joined', id, room: r.id });
+        const tok = crypto.randomBytes(8).toString('hex');
+        r.tokens.set(id, tok);
+        sendJson(ws, { t: 'joined', id, room: r.id, token: tok });
         sendJson(r.host, { t: 'peer', id });
         broadcastRooms();
         break;
@@ -163,6 +177,31 @@ wss.on('connection', (ws) => {
           broadcastRooms();
         }
         break;
+      case 'resume': {
+        // возврат после обрыва: тот же peer id, пока не истёк срок ожидания
+        const r = rooms.get(String(m.room));
+        const pid = parseInt(m.id, 10);
+        if (ws.room || !r || !r.tokens.has(pid) || r.tokens.get(pid) !== m.token || !r.members.has(pid)) {
+          return sendJson(ws, { t: 'error', msg: 'Не удалось вернуться в комнату (время вышло)', fatal: true });
+        }
+        const old = r.members.get(pid);
+        const tm = r.timers.get(pid);
+        if (tm) { clearTimeout(tm); r.timers.delete(pid); }
+        if (old && old !== ws) { old.replaced = true; old.room = null; try { old.terminate(); } catch (e) {} }
+        ws.room = r;
+        ws.peerId = pid;
+        ws.browsing = false;
+        ws.away = false;
+        r.members.set(pid, ws);
+        if (r.host === old || pid === 1) r.host = ws;
+        sendJson(ws, { t: 'resumed', id: pid, room: r.id });
+        if (pid === 1) {
+          for (const [id, c] of r.members) if (id !== 1) sendJson(c, { t: 'host_back' });
+        } else {
+          sendJson(r.host, { t: 'back', id: pid });
+        }
+        break;
+      }
       case 'kick': {
         // хозяин выгоняет участника
         const r = ws.room;
@@ -188,9 +227,25 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    const had = !!ws.room;
-    leaveRoom(ws);
-    if (had) broadcastRooms();
+    if (ws.replaced) return;
+    const r = ws.room;
+    if (!r) return;
+    // обрыв связи: держим место, игрок может вернуться (resume)
+    ws.away = true;
+    const pid = ws.peerId;
+    if (pid === 1) {
+      for (const [id, c] of r.members) if (id !== 1) sendJson(c, { t: 'host_away' });
+    } else if (r.host) {
+      sendJson(r.host, { t: 'away', id: pid });
+    }
+    const ms = r.playing ? GRACE_MATCH_MS : GRACE_LOBBY_MS;
+    r.timers.set(pid, setTimeout(() => {
+      r.timers.delete(pid);
+      if (ws.away && ws.room === r) {
+        leaveRoom(ws);
+        broadcastRooms();
+      }
+    }, ms));
   });
   ws.on('error', () => {});
 });
@@ -230,7 +285,7 @@ setInterval(() => {
     ws.isAlive = false;
     try { ws.ping(); } catch (e) {}
   }
-}, 25000);
+}, 12000);
 setInterval(broadcastRooms, LIST_PUSH_MS);
 
 if (require.main === module) {
